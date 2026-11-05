@@ -1,0 +1,12 @@
+#usda 1.0
+(
+    defaultPrim = "Product"
+    doc = "ahmed — prototype layer (stub; populated as lifecycle progresses)."
+)
+
+over "Product"
+{
+    double arxyne:current:cd = 0.42
+    double arxyne:current:cl = 0.31
+    double arxyne:current:cm_pitch = 0.01
+}

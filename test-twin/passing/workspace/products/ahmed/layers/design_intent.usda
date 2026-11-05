@@ -1,0 +1,18 @@
+#usda 1.0
+(
+    defaultPrim = "Product"
+    doc = "Design intent — what we want this product to achieve."
+)
+
+def Xform "Product" (
+    kind = "component"
+)
+{
+    string arxyne:product:domain = "aero"
+    string arxyne:product:name = "ahmed"
+    string arxyne:target_src:cd = ""
+    string solver_case_template = "ahmed"
+    double target_cd_max = 0.6050000000000001
+    double target_cd_nominal = 0.55
+}
+

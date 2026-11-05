@@ -1,0 +1,284 @@
+name: Arxyne KPI gate
+# 125 characters or fewer: GitHub Marketplace refuses a longer description, and
+# this file is the listing's only source for it.
+description: >-
+  Judge a saved Arxyne result against the product's KPI targets, and fail the job
+  when a declared target is missed.
+author: Arxyne
+branding:
+  icon: activity
+  color: purple
+
+inputs:
+  product:
+    description: The product to judge, as `arxyne` names it (for example `ahmed`).
+    required: true
+  fail_on_gate:
+    description: >-
+      Fail the job when a declared KPI target is missed. Set false for a report-only
+      job that publishes the report and blocks nothing.
+    default: "true"
+  allow_no_targets:
+    description: >-
+      Pass when the product declares no KPI targets at all. FALSE by default: a gate
+      with nothing to check has not proved anything, so reporting it as a pass is the
+      wrong answer for a pipeline.
+    default: "false"
+  arxyne_version:
+    description: >-
+      What to install from PyPI. A bare `arxyne` takes the latest release; pin a
+      version to make a pipeline reproducible.
+    default: arxyne
+  arxyne_home:
+    description: >-
+      Directory holding the products to judge. Leave empty for the default
+      (~/.arxyne), which suits a runner that already has the twin from its own runs.
+    default: ""
+  result_file:
+    description: Where the results document is written.
+    default: arxyne-results.json
+  junit_file:
+    description: >-
+      Where the JUnit report is written. GitHub does not render JUnit, so this is an
+      artefact for whatever reporting tool you already run; the verdict is carried by
+      annotations and the job summary.
+    default: arxyne-gate-junit.xml
+  python_version:
+    description: Python the CLI is installed into.
+    default: "3.12"
+  artifact_name:
+    description: >-
+      Name the two documents are published under. Empty means
+      `arxyne-gate-<job>-<product>`, which is unique per job but NOT per matrix entry
+      - a matrix job gating one product several ways should set this, or the entries
+      overwrite each other.
+    default: ""
+
+outputs:
+  exit_code:
+    description: >-
+      The CLI's own exit status: 0 every declared target passed, 3 a target was
+      missed, 4 nothing declared to gate against, 2 a configuration error.
+    value: ${{ steps.gate.outputs.exit_code }}
+  verdict:
+    description: >-
+      One of `pass`, `missed_target`, `no_targets`, `report_only`, `config_error`.
+    value: ${{ steps.conclusion.outputs.verdict }}
+  failed_rows:
+    description: How many gated KPIs failed.
+    value: ${{ steps.annotate.outputs.failed_rows }}
+  not_judged_rows:
+    description: How many gated KPIs were not judged (NOT RUN, SKIPPED, INCONCLUSIVE).
+    value: ${{ steps.annotate.outputs.not_judged_rows }}
+  declared_rows:
+    description: How many KPI targets the product declared.
+    value: ${{ steps.annotate.outputs.declared_rows }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install the CLI
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ inputs.python_version }}
+
+    - name: Install ${{ inputs.arxyne_version }}
+      shell: bash
+      env:
+        ARXYNE_VERSION: ${{ inputs.arxyne_version }}
+      run: |
+        python -m pip install --quiet --upgrade pip
+        python -m pip install --quiet "${ARXYNE_VERSION}"
+        arxyne --version
+
+    # The exit status IS the verdict, so it is captured rather than allowed to end the
+    # step: `continue-on-error` keeps the job alive long enough to report WHY, and the
+    # conclusion step below decides the job's status from that number alone. A step that
+    # simply failed would leave no summary, no annotation and no artefact on the one run
+    # that matters.
+    - name: Gate
+      id: gate
+      shell: bash
+      continue-on-error: true
+      env:
+        # The CLI prints an [MCP] trace on stdout; a JSON document cannot carry it.
+        ARXYNE_TRACE_MCP: "off"
+        ARXYNE_HOME: ${{ inputs.arxyne_home }}
+        # The CLI starts an MCP server for its own home; a local call must never be
+        # proxied. Only the upper-case form: GitHub env mapping is case-insensitive, so
+        # setting the lower-case spelling too is an error the runner refuses at load.
+        NO_PROXY: 127.0.0.1,localhost
+        # Inputs reach the script through the environment, never by text substitution:
+        # a composite action runs untrusted YAML next to `set +e`, and an input that
+        # contained a newline would otherwise become a second command.
+        ARXYNE_GATE_PRODUCT: ${{ inputs.product }}
+        ARXYNE_RESULTS_JSON: ${{ inputs.result_file }}
+        ARXYNE_JUNIT: ${{ inputs.junit_file }}
+        ARXYNE_FAIL_ON_GATE: ${{ inputs.fail_on_gate }}
+      run: |
+        set +e
+        gate_flag=""
+        if [ "${ARXYNE_FAIL_ON_GATE}" = "true" ]; then gate_flag="--fail-on-gate"; fi
+        arxyne results \
+          --product "${ARXYNE_GATE_PRODUCT}" \
+          --json \
+          --junit "${ARXYNE_JUNIT}" \
+          ${gate_flag} > "${ARXYNE_RESULTS_JSON}"
+        status=$?
+        set -e
+
+        echo "arxyne gate exit ${status}"
+        echo "exit_code=${status}" >> "$GITHUB_OUTPUT"
+
+        # The document is printed AFTER the status is captured, so a reader sees the
+        # rows even when the gate refused. A refused read (2) writes nothing.
+        if [ -s "${ARXYNE_RESULTS_JSON}" ]; then cat "${ARXYNE_RESULTS_JSON}"; fi
+
+    # Annotations are the smaller promise: they render on the check run with no third
+    # party, which is the parity that matters on GitHub. `file=`/`line=` are deliberately
+    # NOT emitted - a KPI has no source line, and an annotation pointing at a guess would
+    # be worse than one that only names the requirement.
+    - name: Report
+      id: annotate
+      if: ${{ !cancelled() }}
+      shell: bash
+      env:
+        RESULT_FILE: ${{ inputs.result_file }}
+        PRODUCT: ${{ inputs.product }}
+      run: |
+        python3 - <<'PY'
+        import json
+        import os
+
+        result_file = os.environ["RESULT_FILE"]
+        product = os.environ["PRODUCT"]
+        failed = 0
+        not_judged = 0
+
+        def esc(value: str) -> str:
+            """Escape the characters GitHub's command syntax treats as structure."""
+            return value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+        try:
+            with open(result_file, encoding="utf-8") as handle:
+                view = json.load(handle)
+        except (OSError, ValueError):
+            view = {}
+
+        gates = view.get("gates") or {}
+        rows = gates.get("rows") or []
+        attestation = gates.get("attestation") or {}
+        declared = attestation.get("declared")
+
+        # The row's own status string is printed verbatim: the summary must name a KPI
+        # and a verdict the way the terminal does, not in a synonym this file invents.
+        table = ["| KPI | Status | Detail |", "|---|---|---|"]
+        for row in rows:
+            name = row.get("name") or row.get("kpi") or row.get("req_id") or "unknown"
+            status = str(row.get("status") or "")
+            message = str(row.get("message") or "")
+            table.append(f"| {name} | {status} | {message} |")
+            if row.get("passed") is False:
+                failed += 1
+                print(f"::error title=KPI target missed: {name}::{esc(message or status)}")
+            elif row.get("passed") is None:
+                not_judged += 1
+                print(f"::warning title=KPI not judged: {name}::{esc(message or status)}")
+
+        heading = f"## Arxyne KPI gate: {product}"
+        if declared is None:
+            # No document at all means the CLI refused before reading (exit 2). Saying so
+            # is the point: a green job with no summary would look like a check that passed.
+            body = [heading, "", "The gate produced no result document. See the job log."]
+        else:
+            counts = f"{declared} declared, {failed} failed, {not_judged} not judged"
+            body = [heading, "", counts, ""] + (table if rows else ["No gated KPI rows."])
+
+        summary = os.environ.get("GITHUB_STEP_SUMMARY")
+        if summary:
+            with open(summary, "a", encoding="utf-8") as handle:
+                handle.write("\n".join(body) + "\n")
+
+        with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+            handle.write(f"failed_rows={failed}\n")
+            handle.write(f"not_judged_rows={not_judged}\n")
+            if declared is not None:
+                # Absent document, absent count: writing a zero here would claim the
+                # product declared nothing, which is a fact only a read can establish.
+                handle.write(f"declared_rows={declared}\n")
+        PY
+
+    # The documents are published whether or not the gate blocks, as the GitLab component
+    # publishes them with `when: always`: a report-only job exists to hand the result to
+    # the next reader, and a gate that failed is exactly when the file is worth keeping.
+    - name: Publish the documents
+      if: ${{ always() }}
+      uses: actions/upload-artifact@v4
+      with:
+        # Named for the job AND the product: GitHub names artefacts per run, so a
+        # product-only name lets two jobs in one workflow overwrite each other.
+        # `artifact_name` exists because a matrix job shares one job id across entries.
+        name: ${{ inputs.artifact_name != '' && inputs.artifact_name || format('arxyne-gate-{0}-{1}', github.job, inputs.product) }}
+        path: |
+          ${{ inputs.result_file }}
+          ${{ inputs.junit_file }}
+        # A configuration error writes nothing, and that is not a failure to publish.
+        if-no-files-found: ignore
+        retention-days: 7
+        overwrite: true
+
+    # One place decides the job's status, so the mapping cannot drift from the CLI's own
+    # contract. Codes: 0 passed, 3 missed, 4 nothing declared, 2 configuration error.
+    #
+    # The ORDER is the contract. A report-only job passes whatever the verdict was, with
+    # exit 2 the single exception: a gate that could not run must not look green, whatever
+    # the job was asked to do. Everything below the report-only branch is a blocking job.
+    - name: Conclusion
+      id: conclusion
+      shell: bash
+      env:
+        EXIT_CODE: ${{ steps.gate.outputs.exit_code }}
+        FAILED_ROWS: ${{ steps.annotate.outputs.failed_rows }}
+        FAIL_ON_GATE: ${{ inputs.fail_on_gate }}
+        ALLOW_NO_TARGETS: ${{ inputs.allow_no_targets }}
+        PRODUCT: ${{ inputs.product }}
+      run: |
+        status="${EXIT_CODE:-2}"
+        failed="${FAILED_ROWS:-0}"
+
+        if [ "${status}" = "2" ]; then
+          verdict="config_error"
+          echo "::error title=Arxyne KPI gate::the gate could not run (exit ${status}). See the job log."
+        elif [ "${FAIL_ON_GATE}" != "true" ]; then
+          # `report_only` is the verdict even when nothing was missed: the job published a
+          # result and refused nothing, and calling that "pass" would read as approval of
+          # a result this job never judged. `failed_rows` and the annotations carry what
+          # the data said.
+          verdict="report_only"
+          echo "Report-only job: the gate exited ${status}, ${failed} KPI target(s) missed, and this job does not block."
+        elif [ "${status}" = "0" ]; then
+          verdict="pass"
+          echo "Every declared KPI target passed."
+        elif [ "${status}" = "3" ]; then
+          verdict="missed_target"
+          echo "::error title=Arxyne KPI gate::'${PRODUCT}' missed a declared KPI target."
+        elif [ "${status}" = "4" ]; then
+          if [ "${ALLOW_NO_TARGETS}" = "true" ]; then
+            verdict="pass"
+            echo "No KPI targets declared for '${PRODUCT}' - nothing to gate, passing as allowed."
+          else
+            verdict="no_targets"
+            echo "::error title=Arxyne KPI gate::'${PRODUCT}' declares no KPI targets, so nothing was tested."
+          fi
+        else
+          # The CLI emits only 0, 2, 3 and 4, so this is a fault in the gate itself.
+          verdict="config_error"
+          echo "::error title=Arxyne KPI gate::the gate could not run (exit ${status}). See the job log."
+        fi
+
+        echo "verdict=${verdict}" >> "$GITHUB_OUTPUT"
+
+        case "${verdict}" in
+          pass|report_only) exit 0 ;;
+          *) exit 1 ;;
+        esac

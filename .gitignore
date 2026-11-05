@@ -1,0 +1,3 @@
+# Written by the CLI when it runs against a twin tree during a local test.
+.version-check
+logs/

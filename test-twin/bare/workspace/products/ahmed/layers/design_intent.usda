@@ -1,0 +1,14 @@
+#usda 1.0
+(
+    defaultPrim = "Product"
+    doc = "Design intent — what we want this product to achieve."
+)
+
+def Xform "Product" (
+    kind = "component"
+)
+{
+    string arxyne:product:domain = "aero"
+    string arxyne:product:name = "ahmed"
+    string solver_case_template = "ahmed"
+}

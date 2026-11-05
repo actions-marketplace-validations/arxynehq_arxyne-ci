@@ -1,0 +1,9 @@
+#usda 1.0
+(
+    defaultPrim = "Product"
+    doc = "ahmed — twin layer (stub; populated as lifecycle progresses)."
+)
+
+over "Product"
+{
+}

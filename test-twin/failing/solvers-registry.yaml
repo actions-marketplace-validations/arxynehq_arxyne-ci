@@ -1,0 +1,39 @@
+# A solver CONTRACT, committed so a Docker-less runner can resolve the product's domain and KPIs.
+#
+# Why this file exists: the gate needs to know which KPIs a product has and which domain they
+# belong to. That normally comes from the solver's Docker image (`/solver/solver.yaml`), and a
+# stock CI runner has no Docker. `_enrich_config` returns the bare record when the image is absent
+# (`if not _image_available_locally(image): return base`), so scope, products, domain and kpi_spec
+# all vanish, `get_domain_schemas()` returns {}, and every KPI is filtered out by `_kpi_in_domains`.
+# The gate then answers "no targets declared" (exit 4) for a twin that plainly has a target.
+#
+# `domains:` is a LIST. `get_domain_schemas` reads `cfg.get("domains") or []`, so a singular
+# `domain:` key silently builds no schema — measured 2026-10-27.
+solvers:
+  openfoam-gate:
+    name: OpenFOAM
+    kind: physics
+    domain: aero
+    domains:
+      - aero
+    image: ghcr.io/arxynehq/arxyne-solver-openfoam:0.2.24
+    tier: builtin
+    origin: internal
+    scope:
+      products:
+        - ahmed
+    products:
+      ahmed:
+        domain: aero
+    kpi_spec:
+      kpis:
+        cd:
+          direction: minimize
+          unit: ""
+          tolerance: 0.10
+        cl:
+          direction: maximize
+          unit: ""
+        cm_pitch:
+          direction: neutral
+          unit: ""

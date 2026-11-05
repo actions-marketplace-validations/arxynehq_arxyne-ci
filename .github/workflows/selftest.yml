@@ -1,0 +1,279 @@
+# The action's own test: every branch of the exit-code mapping, run through the real
+# `uses:` path against a real CLI, the way a customer runs it.
+#
+# The cases are the GitLab component's `test-component.sh` cases, one for one - a twin
+# each (scaffolding a product needs a solver contract from a solver image, so a runner
+# without Docker cannot make one) and a distinct runner per case, because the CLI's MCP
+# server outlives its command and two cases on one port read each other's twin.
+#
+# Assertions are on the OUTPUTS, not on a grep of the log: the exit code, the verdict and
+# the row counts are what the mapping produces, and a wrong mapping must fail here rather
+# than in a customer's pipeline.
+
+name: selftest
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  # The GitLab component runs its contract job on a schedule so a bad PyPI release turns
+  # its pipeline red unprompted. Same job here: the CLI is installed bare, so the daily
+  # run tests the wheel a customer gets today, not a pinned one.
+  schedule:
+    - cron: "37 4 * * *"
+
+# actions: read is what lets the artefact step query this run's own artefacts; nothing
+# here needs write access.
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  # The GitLab component asserts its own shape - a spec document plus a visible job with
+  # `artifacts.reports.junit` - because a template that parses but produces no job looks
+  # correct in the file. GitHub validates the manifest on load instead, which is how the
+  # duplicate-NO_PROXY fault surfaced, so what is left to assert here is the CONTRACT the
+  # workflow cannot see: the defaults, and the outputs callers bind to.
+  contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assert the manifest's shape and defaults
+        run: |
+          python3 - <<'PY'
+          import sys
+          import yaml
+
+          doc = yaml.safe_load(open("action.yml", encoding="utf-8"))
+          for key in ("name", "description", "runs"):
+              if key not in doc:
+                  sys.exit(f"action.yml has no {key}")
+          if doc["runs"].get("using") != "composite":
+              sys.exit(f"runs.using is {doc['runs'].get('using')!r}, expected 'composite'")
+
+          # A default nobody asserts is a default that drifts, and these two are the whole
+          # safety story: a gate with nothing to check must fail, and a gate must bite.
+          want = {"allow_no_targets": "false", "fail_on_gate": "true"}
+          for name, expected in want.items():
+              got = str(doc["inputs"][name].get("default", "")).lower()
+              if got != expected:
+                  sys.exit(f"inputs.{name} defaults to {got!r}, expected {expected!r}")
+
+          for output in ("exit_code", "verdict", "failed_rows", "declared_rows", "not_judged_rows"):
+              if output not in doc.get("outputs", {}):
+                  sys.exit(f"no {output} output")
+
+          if doc["inputs"]["product"].get("required") is not True:
+              sys.exit("product must be required: a gate with no product judges nothing")
+          print(f"manifest OK: {len(doc['inputs'])} inputs, {len(doc['outputs'])} outputs")
+          PY
+
+  defaults-visible:
+    # `allow_no_targets: false` is asserted above; this asserts what it DOES, which is the
+    # part a caller feels. Run with no explicit inputs beyond the product: a bare twin must
+    # fail, because the shipped default is to require targets.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: gate
+        uses: ./
+        continue-on-error: true
+        with:
+          product: ahmed
+          arxyne_home: ${{ github.workspace }}/test-twin/bare
+          result_file: results.json
+          junit_file: gate.xml
+      - name: A product with no targets fails on the default inputs
+        run: |
+          want_outcome=action_required
+          echo "outcome=${{ steps.gate.outcome }} verdict=${{ steps.gate.outputs.verdict }} exit=${{ steps.gate.outputs.exit_code }}"
+          test "${{ steps.gate.outcome }}" = "failure" || { echo "::error title=selftest::a bare product passed on the defaults"; exit 1; }
+          test "${{ steps.gate.outputs.verdict }}" = "no_targets" || { echo "::error title=selftest::verdict is not no_targets"; exit 1; }
+
+  gate-case:
+    runs-on: ubuntu-latest
+    needs: contract
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: a product whose targets pass
+            slug: pass
+            product: ahmed
+            twin: passing
+            fail_on_gate: "true"
+            allow_no_targets: "false"
+            outcome: success
+            verdict: pass
+            exit_code: "0"
+            failed_rows: "0"
+            declared_rows: "1"
+          - label: a product that misses its target
+            slug: missed
+            product: ahmed
+            twin: failing
+            fail_on_gate: "true"
+            allow_no_targets: "false"
+            outcome: failure
+            verdict: missed_target
+            exit_code: "3"
+            failed_rows: "1"
+            declared_rows: "1"
+          - label: no targets, allowed to pass
+            slug: no-targets-allowed
+            product: ahmed
+            twin: bare
+            fail_on_gate: "true"
+            allow_no_targets: "true"
+            outcome: success
+            verdict: pass
+            exit_code: "4"
+            failed_rows: "0"
+            declared_rows: "0"
+          - label: no targets, and the job insists targets exist
+            slug: no-targets-refused
+            product: ahmed
+            twin: bare
+            fail_on_gate: "true"
+            allow_no_targets: "false"
+            outcome: failure
+            verdict: no_targets
+            exit_code: "4"
+            failed_rows: "0"
+            declared_rows: "0"
+          - label: report-only job over a failing verdict
+            slug: report-only-missed
+            product: ahmed
+            twin: failing
+            fail_on_gate: "false"
+            allow_no_targets: "false"
+            outcome: success
+            # Report-only passes the report WITHOUT the --fail-on-gate flag, so the CLI
+            # itself exits 0 on a missed target - the same contract as the GitLab
+            # component's report-only job. What proves the verdict was seen and reported
+            # is failed_rows and the annotation, not the exit code.
+            verdict: report_only
+            exit_code: "0"
+            failed_rows: "1"
+            declared_rows: "1"
+          - label: report-only job over a product that declares nothing
+            slug: report-only-nothing
+            product: ahmed
+            twin: bare
+            fail_on_gate: "false"
+            allow_no_targets: "false"
+            outcome: success
+            verdict: report_only
+            exit_code: "0"
+            failed_rows: "0"
+            declared_rows: "0"
+          - label: a product the CLI cannot resolve
+            slug: unresolved
+            product: not-a-product
+            twin: passing
+            fail_on_gate: "true"
+            allow_no_targets: "false"
+            outcome: failure
+            verdict: config_error
+            exit_code: "2"
+            failed_rows: "0"
+            declared_rows: ""
+          - label: report-only job over a product the CLI cannot resolve
+            slug: report-only-unresolved
+            product: not-a-product
+            twin: passing
+            fail_on_gate: "false"
+            allow_no_targets: "false"
+            outcome: failure
+            # Exit 2 is the one status a report-only job must NOT swallow: a gate that
+            # could not run has no verdict to publish, so a green job would be a lie.
+            verdict: config_error
+            exit_code: "2"
+            failed_rows: "0"
+            declared_rows: ""
+
+    name: ${{ matrix.label }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: gate
+        uses: ./
+        continue-on-error: true
+        with:
+          product: ${{ matrix.product }}
+          arxyne_home: ${{ github.workspace }}/test-twin/${{ matrix.twin }}
+          fail_on_gate: ${{ matrix.fail_on_gate }}
+          allow_no_targets: ${{ matrix.allow_no_targets }}
+          result_file: results.json
+          junit_file: gate.xml
+          # Every matrix entry shares this job's id, so the default name would have them
+          # overwrite each other; the slug is what keeps eight artefacts distinct.
+          artifact_name: arxyne-gate-${{ matrix.slug }}
+
+      - name: Assert the verdict
+        run: |
+          check() { # check <actual> <expected> <name>
+            if [ "$1" = "$2" ]; then
+              echo "ok: $3 = $2"
+            else
+              echo "::error title=selftest::$3: want '$2', got '$1'"
+              exit 1
+            fi
+          }
+          check "${{ steps.gate.outcome }}" "${{ matrix.outcome }}" "job outcome"
+          check "${{ steps.gate.outputs.verdict }}" "${{ matrix.verdict }}" "verdict"
+          check "${{ steps.gate.outputs.exit_code }}" "${{ matrix.exit_code }}" "exit code"
+          check "${{ steps.gate.outputs.failed_rows }}" "${{ matrix.failed_rows }}" "failed rows"
+          check "${{ steps.gate.outputs.declared_rows }}" "${{ matrix.declared_rows }}" "declared rows"
+
+      - name: Assert the report and the documents
+        if: ${{ matrix.exit_code != '2' }}
+        env:
+          WANT_FAILURES: ${{ matrix.failed_rows }}
+        run: |
+          # A case that reached a verdict must leave a parseable document and report. A
+          # configuration error (2) never gets that far: the CLI refuses before reading, so
+          # there is nothing to write and requiring a file would assert something false.
+          # Exit 4 DOES write both - the read succeeded, nothing was declared.
+          python3 - <<'PY'
+          import json
+          import os
+          import xml.etree.ElementTree as ET
+
+          view = json.load(open("results.json", encoding="utf-8"))
+          suite = ET.parse("gate.xml").getroot()
+
+          # The report must agree with the document: one testcase per gated KPI, and the
+          # failure count the document's rows justify. Two renderings of one verdict that
+          # disagree is worse than either alone.
+          declared = view["gates"]["attestation"]["declared"]
+          want = os.environ["WANT_FAILURES"]
+          failures = suite.get("failures", "0")
+          if failures != want:
+              raise SystemExit(f"gate.xml reports {failures} failures, rows say {want}")
+          if int(suite.get("tests", "0")) != declared:
+              raise SystemExit(f"gate.xml has {suite.get('tests')} cases, {declared} declared")
+          print(f"ok: results.json and gate.xml agree ({declared} declared, {failures} failed)")
+          PY
+
+      - name: Assert the artefacts were published
+        if: ${{ matrix.exit_code != '2' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WANT_NAME: arxyne-gate-${{ matrix.slug }}
+        run: |
+          # The GitLab component publishes the two documents as artefacts with `when:
+          # always`; the upload step mirrors that. A step succeeding is not proof an
+          # artefact exists, so query this run's artefacts and match the name.
+          for _ in 1 2 3 4 5 6; do
+            if gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" \
+                 --jq ".artifacts[] | select(.name == \"${WANT_NAME}\") | .name" | grep -qx "${WANT_NAME}"; then
+              echo "ok: artefact ${WANT_NAME} is on this run"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::error title=selftest::no artefact named ${WANT_NAME} on run ${{ github.run_id }}"
+          exit 1
